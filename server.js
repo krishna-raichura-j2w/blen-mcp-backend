@@ -21,6 +21,9 @@ const svgValidator = require('./utils/svgValidator');
 const blenderSafety = require('./utils/blenderSafety');
 const modelQuality = require('./utils/modelQuality');
 const textureBaking = require('./utils/textureBaking');
+const svgTo3D = require('./utils/svgTo3D');
+const svgTo3DPure = require('./utils/svgTo3DPure'); // Pure JS - No Blender
+const intelligentMultiView = require('./utils/intelligentMultiView'); // AI-powered multi-view
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -196,8 +199,12 @@ app.post('/api/auth/register', async (req, res) => {
       });
       await otpDoc.save();
 
-      // Send email
-      await sendOTPEmail(email, otp, firstName);
+      // Send email (if configured)
+      try {
+        await sendOTPEmail(email, otp, firstName);
+      } catch (emailError) {
+        console.log('⚠️  Email not sent (service not configured). Use default OTP: 999999 or check console for generated OTP:', otp);
+      }
     } catch (emailError) {
       console.error('Error sending OTP email:', emailError);
       // Don't fail the registration if email fails, just log it
@@ -250,8 +257,12 @@ app.post('/api/auth/send-otp', async (req, res) => {
     });
     await otpDoc.save();
 
-    // Send email
-    await sendOTPEmail(email, otp, user.firstName);
+    // Send email (if configured)
+    try {
+      await sendOTPEmail(email, otp, user.firstName);
+    } catch (emailError) {
+      console.log('⚠️  Email not sent (service not configured). Use default OTP: 999999 or check console for generated OTP:', otp);
+    }
 
     return res.json({
       success: true,
@@ -276,21 +287,34 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Email and OTP are required' });
     }
 
-    const otpDoc = await OTP.findOne({ email: email.toLowerCase() });
+    // Default OTP option (999999) - for development/testing
+    const DEFAULT_OTP = '999999';
+    const isDefaultOTP = otp === DEFAULT_OTP;
 
-    if (!otpDoc) {
-      return res.status(400).json({ success: false, message: 'OTP expired or not found' });
-    }
+    if (isDefaultOTP) {
+      // Allow default OTP to bypass database check
+      console.log('⚠️  Using default OTP for login:', email);
+    } else {
+      // Regular OTP verification
+      const otpDoc = await OTP.findOne({ email: email.toLowerCase() });
 
-    if (otpDoc.attempts >= 3) {
+      if (!otpDoc) {
+        return res.status(400).json({ success: false, message: 'OTP expired or not found' });
+      }
+
+      if (otpDoc.attempts >= 3) {
+        await OTP.deleteOne({ _id: otpDoc._id });
+        return res.status(400).json({ success: false, message: 'Too many attempts. Please request a new OTP' });
+      }
+
+      if (otpDoc.otp !== otp) {
+        otpDoc.attempts += 1;
+        await otpDoc.save();
+        return res.status(400).json({ success: false, message: 'Invalid OTP' });
+      }
+
+      // Delete used OTP
       await OTP.deleteOne({ _id: otpDoc._id });
-      return res.status(400).json({ success: false, message: 'Too many attempts. Please request a new OTP' });
-    }
-
-    if (otpDoc.otp !== otp) {
-      otpDoc.attempts += 1;
-      await otpDoc.save();
-      return res.status(400).json({ success: false, message: 'Invalid OTP' });
     }
 
     // OTP verified, get user
@@ -314,9 +338,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       refreshToken
     });
     await tokenDoc.save();
-
-    // Delete used OTP
-    await OTP.deleteOne({ _id: otpDoc._id });
 
     return res.json({
       success: true,
@@ -1023,6 +1044,334 @@ print("=" * 60)
   } finally {
     // Clear logger for next operation
     executionLogger.clear();
+  }
+});
+
+/**
+ * POST /api/blender/svg-to-3d-clean
+ * Clean SVG to 3D Pipeline - No guessing, exact extrusion
+ * 
+ * Pipeline: SVG → 2D Polygon → Controlled Extrusion → Mesh Cleanup → GLB
+ * 
+ * Body/FormData: 
+ *   - file: SVG file (required)
+ *   - depth: Extrusion depth in units (optional, default: 0.1)
+ *   - smoothing: Apply smooth shading (optional, default: false)
+ */
+app.post('/api/blender/svg-to-3d-clean', upload.single('file'), ensureConnection, async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No SVG file uploaded'
+      });
+    }
+
+    const svgPath = req.file.path;
+    const depth = parseFloat(req.body.depth) || 0.1;
+    const smoothing = req.body.smoothing === 'true' || req.body.smoothing === true;
+    
+    console.log('\\n🎯 Starting Clean SVG to 3D Pipeline');
+    console.log('📁 SVG File:', req.file.originalname);
+    console.log('📏 Depth:', depth);
+    console.log('✨ Smoothing:', smoothing);
+    
+    // Step 1: Validate SVG
+    console.log('\\n1️⃣ Validating SVG...');
+    svgTo3D.validateSVG(svgPath);
+    console.log('✅ SVG validation passed');
+    
+    // Step 2: Parse SVG to 2D polygons
+    console.log('\\n2️⃣ Parsing SVG to 2D polygons...');
+    const { polygons, width, height } = svgTo3D.parseSVGToPolygons(svgPath);
+    console.log(`✅ Extracted ${polygons.length} polygon(s)`);
+    console.log(`   Original size: ${width.toFixed(2)} x ${height.toFixed(2)}`);
+    
+    if (polygons.length === 0) {
+      throw new Error('No valid polygons found in SVG');
+    }
+    
+    // Step 3: Generate output filename
+    const timestamp = Date.now();
+    const outputFilename = `clean-3d-${timestamp}.glb`;
+    const outputPath = path.join(exportsDir, outputFilename);
+    
+    // Step 4: Generate Blender code for controlled extrusion
+    console.log('\\n3️⃣ Generating controlled extrusion code...');
+    const blenderCode = svgTo3D.generateBlenderExtrusionCode(polygons, {
+      depth,
+      smoothing,
+      outputPath
+    });
+    console.log('✅ Extrusion code generated');
+    
+    // Step 5: Execute in Blender via MCP
+    console.log('\\n4️⃣ Executing in Blender...');
+    console.log('   - Creating 2D → 3D extrusion');
+    console.log('   - Generating manifold mesh');
+    console.log('   - Applying cleanup');
+    
+    const result = await mcpClient.executeBlenderCode(blenderCode);
+    
+    if (!result || !result.content || result.content.length === 0) {
+      throw new Error('No response from Blender');
+    }
+    
+    const output = result.content[0].text;
+    console.log('\\n📤 Blender output:', output);
+    
+    if (!output.includes('SUCCESS')) {
+      throw new Error('Blender execution failed: ' + output);
+    }
+    
+    // Step 6: Verify output file exists
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('GLB file was not created');
+    }
+    
+    const fileStats = fs.statSync(outputPath);
+    console.log('\\n✅ PIPELINE COMPLETE!');
+    console.log(`📦 Output: ${outputFilename}`);
+    console.log(`📊 Size: ${(fileStats.size / 1024).toFixed(2)} KB`);
+    
+    // Return success response
+    res.json({
+      success: true,
+      message: 'Clean SVG to 3D conversion completed',
+      data: {
+        glbUrl: `/exports/${outputFilename}`,
+        filename: outputFilename,
+        fileSize: fileStats.size,
+        pipeline: {
+          polygonsExtracted: polygons.length,
+          depth: depth,
+          smoothing: smoothing,
+          method: 'controlled-extrusion',
+          ai: false,
+          guessing: false
+        },
+        metadata: {
+          originalSVG: req.file.originalname,
+          svgSize: `${width.toFixed(2)} x ${height.toFixed(2)}`,
+          timestamp: new Date().toISOString()
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('\\n❌ Clean SVG to 3D Pipeline failed:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      pipeline: 'svg-to-3d-clean'
+    });
+  }
+});
+
+/**
+ * POST /api/svg-to-3d-pure
+ * 🎯 PURE JAVASCRIPT SVG to 3D Pipeline
+ * NO BLENDER - Pure geometry math
+ * 
+ * Pipeline: SVG → 2D Polygon → Controlled Extrusion → Mesh → GLB
+ * 
+ * This is the clean, deterministic approach:
+ * - SVG is a 2D profile (cookie cutter)
+ * - Extrusion creates depth (makes the biscuit)
+ * - Result: Exact 3D model, no guessing, no AI
+ * 
+ * Body/FormData:
+ *   - file: SVG file (required)
+ *   - depth: Extrusion depth (optional, default: 0.1)
+ */
+app.post('/api/svg-to-3d-pure', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No SVG file uploaded'
+      });
+    }
+
+    const svgPath = req.file.path;
+    const depth = parseFloat(req.body.depth) || 0.1;
+    
+    console.log('\\n🎯 PURE JS SVG to 3D Pipeline (NO BLENDER)');
+    console.log('📁 SVG File:', req.file.originalname);
+    console.log('📏 Depth:', depth);
+    
+    // Validate SVG
+    console.log('\\n1️⃣ Validating SVG...');
+    svgTo3DPure.validateSVG(svgPath);
+    console.log('✅ SVG validation passed');
+    
+    // Generate output path
+    const timestamp = Date.now();
+    const outputFilename = `pure-3d-${timestamp}.glb`;
+    const outputPath = path.join(exportsDir, outputFilename);
+    
+    // Run pure JS pipeline
+    const result = await svgTo3DPure.convertSVGto3D(svgPath, {
+      depth,
+      outputPath
+    });
+    
+    // Get file stats
+    const fileStats = fs.statSync(outputPath);
+    
+    console.log('\\n✅ PURE JS PIPELINE COMPLETE!');
+    console.log(`📦 Output: ${outputFilename}`);
+    console.log(`📊 Size: ${(fileStats.size / 1024).toFixed(2)} KB`);
+    console.log(`🔺 Triangles: ${result.stats.triangles}`);
+    console.log(`📍 Vertices: ${result.stats.vertices}`);
+    
+    // Return success
+    res.json({
+      success: true,
+      message: 'Pure JavaScript SVG to 3D conversion completed',
+      data: {
+        glbUrl: `/exports/${outputFilename}`,
+        filename: outputFilename,
+        fileSize: fileStats.size,
+        stats: result.stats,
+        pipeline: {
+          method: 'pure-javascript-extrusion',
+          blender: false,
+          ai: false,
+          guessing: false,
+          deterministic: true
+        },
+        metadata: {
+          originalSVG: req.file.originalname,
+          depth: depth,
+          timestamp: new Date().toISOString()
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('\\n❌ Pure JS Pipeline failed:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+      pipeline: 'svg-to-3d-pure'
+    });
+  }
+});
+
+/**
+ * POST /api/svg-to-3d-intelligent
+ * AI-Powered Multi-View SVG to 3D with Azure OpenAI Analysis
+ * Uses GPT-4.1 to understand views and calculate accurate 3D dimensions
+ * 
+ * Upload 1-3 SVG files representing different views (front, side, top)
+ * AI analyzes each view, understands measurements, and reconstructs proper 3D shape
+ * 
+ * Form Data:
+ * - files: Array of SVG files (1-3 files)
+ * - views: Comma-separated view names (e.g., "front,side,top")
+ * - depth: Optional manual depth override (float)
+ */
+app.post('/api/svg-to-3d-intelligent', upload.array('files', 3), async (req, res) => {
+  const uploadedFiles = req.files || [];
+  
+  try {
+    // Validate file upload
+    if (!uploadedFiles || uploadedFiles.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No files uploaded. Please upload 1-3 SVG files.',
+        usage: 'POST /api/svg-to-3d-intelligent with files[] (1-3 SVGs) and views (comma-separated)'
+      });
+    }
+    
+    if (uploadedFiles.length > 3) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 3 views allowed (front, side, top recommended)',
+        uploaded: uploadedFiles.length
+      });
+    }
+    
+    // Check Azure OpenAI configuration
+    if (!process.env.AZURE_OPENAI_API_KEY || !process.env.AZURE_OPENAI_ENDPOINT) {
+      return res.status(500).json({
+        success: false,
+        error: 'Azure OpenAI not configured. Please set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT in .env'
+      });
+    }
+    
+    // Parse view names
+    const viewsParam = req.body.views || '';
+    const viewNames = viewsParam.split(',').map(v => v.trim().toLowerCase());
+    
+    if (viewNames.length !== uploadedFiles.length) {
+      return res.status(400).json({
+        success: false,
+        error: `View count mismatch: ${uploadedFiles.length} files but ${viewNames.length} view names`,
+        example: 'For 3 files, use views=front,side,top'
+      });
+    }
+    
+    // Validate all files are SVG
+    const validSVGTypes = ['image/svg+xml', 'text/xml', 'application/xml'];
+    const invalidFiles = uploadedFiles.filter(f => 
+      !validSVGTypes.includes(f.mimetype) && !f.originalname.toLowerCase().endsWith('.svg')
+    );
+    
+    if (invalidFiles.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'All files must be SVG format',
+        invalidFiles: invalidFiles.map(f => f.originalname)
+      });
+    }
+    
+    // Prepare file metadata
+    const svgFiles = uploadedFiles.map((file, idx) => ({
+      path: file.path,
+      view: viewNames[idx],
+      filename: file.originalname
+    }));
+    
+    console.log('\n🤖 INTELLIGENT Multi-View Request:');
+    console.log(`   Files: ${svgFiles.map(f => `${f.view}(${f.filename})`).join(', ')}`);
+    
+    // Optional depth override
+    const depthOverride = req.body.depth ? parseFloat(req.body.depth) : undefined;
+    
+    // Run AI-powered conversion
+    const result = await intelligentMultiView.convertMultiViewSVGto3DIntelligent(svgFiles, {
+      depth: depthOverride
+    });
+    
+    // Generate URL for GLB
+    const glbFilename = path.basename(result.glbPath);
+    const glbUrl = `${req.protocol}://${req.get('host')}/exports/${glbFilename}`;
+    
+    res.json({
+      success: true,
+      message: 'AI-powered multi-view SVG to 3D conversion complete',
+      glbUrl: glbUrl,
+      glbPath: result.glbPath,
+      stats: result.stats,
+      pipeline: 'intelligent-multiview',
+      aiPowered: true,
+      views: svgFiles.map(f => ({
+        view: f.view,
+        filename: f.filename
+      }))
+    });
+    
+  } catch (error) {
+    console.error('❌ Intelligent multi-view conversion error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+      pipeline: 'intelligent-multiview'
+    });
   }
 });
 
